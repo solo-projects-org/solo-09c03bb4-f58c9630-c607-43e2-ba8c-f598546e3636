@@ -5,10 +5,15 @@ from __future__ import annotations
 import os
 from collections.abc import Generator
 
-from sqlalchemy import String, create_engine
+from sqlalchemy import String, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 DB_PATH = os.getenv("SCENIC_DB_PATH", "/data/scenic.db")
+
+# 报表生命周期状态：在线（参与在线求解与查数）/ 归档（留档备查，不参与查数）。
+STATUS_ONLINE = "online"
+STATUS_ARCHIVED = "archived"
+VALID_STATUSES = (STATUS_ONLINE, STATUS_ARCHIVED)
 
 
 class Base(DeclarativeBase):
@@ -23,6 +28,10 @@ class ReportRow(Base):
     end_date: Mapped[str] = mapped_column(String(10), nullable=False)
     total: Mapped[int] = mapped_column(nullable=False)
     version: Mapped[int] = mapped_column(default=1, nullable=False)
+    # 旧库（v1.0）无此列，init_db 会自动 ALTER 补列，存量报表默认在线。
+    status: Mapped[str] = mapped_column(
+        String(16), default=STATUS_ONLINE, nullable=False, server_default=STATUS_ONLINE
+    )
 
 
 def _connect_args() -> dict:
@@ -49,10 +58,17 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
-    # WAL 让读请求与写请求互不阻塞。
     with engine.begin() as conn:
-        from sqlalchemy import text
-
+        # 兼容旧版 SQLite 库：缺 status 列时在线 DDL 补上，存量报表视为在线。
+        columns = {col["name"] for col in inspect(conn).get_columns("reports")}
+        if "status" not in columns:
+            conn.execute(
+                text(
+                    f"ALTER TABLE reports ADD COLUMN status VARCHAR(16) "
+                    f"NOT NULL DEFAULT '{STATUS_ONLINE}'"
+                )
+            )
+        # WAL 让读请求与写请求互不阻塞。
         conn.execute(text("PRAGMA journal_mode=WAL"))
         conn.execute(text("PRAGMA foreign_keys=ON"))
 

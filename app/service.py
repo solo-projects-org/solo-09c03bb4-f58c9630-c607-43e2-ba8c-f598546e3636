@@ -1,4 +1,15 @@
-"""业务服务层：整批原子提交、冲突诊断、求解缓存。"""
+"""业务服务层：整批原子提交、归档判定、冲突诊断、求解缓存。
+
+报表分两种状态：
+
+* 在线（online）：参与在线求解与日明细查数；
+* 归档（archived）：原件留档备查，不参与查数，但其档期总量必须始终能由
+  当前在线报表唯一推出——每次写操作后都会重新核对，失去依据的归档件随
+  补报恢复在线。
+
+所有写操作经同一把锁串行化，且全部先在提交时的数据快照上完成验算，
+验算失败不写库（单事务回滚），报表状态不变。
+"""
 
 from __future__ import annotations
 
@@ -9,12 +20,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import solver
-from .database import ReportRow
+from .database import STATUS_ARCHIVED, STATUS_ONLINE, ReportRow
 from .solver import MAX_REPORT_COUNT, Report, ReportValidationError, SolvedSystem
 
 
 class CapacityExceededError(Exception):
-    """现行报表数量超过 120 份上限。"""
+    """报表数量超过 120 份上限（含归档件）。"""
 
 
 class BatchConflictError(Exception):
@@ -26,12 +37,21 @@ class BatchConflictError(Exception):
         super().__init__(reason)
 
 
+class ArchiveConditionError(Exception):
+    """整批移出后，部分报表总量无法由剩余在线报表唯一推出。"""
+
+    def __init__(self, non_derivable_ids: list[str], reason: str):
+        self.non_derivable_ids = non_derivable_ids
+        self.reason = reason
+        super().__init__(reason)
+
+
 class ReportService:
     """所有写操作经同一把锁串行化；读操作走快照 + 版本缓存。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._cache: SolvedSystem | None = None  # 现行报表求解结果，提交后失效
+        self._cache: SolvedSystem | None = None  # 在线报表求解结果，写操作后失效
 
     # ------------------------------------------------------------------ #
     # 映射
@@ -45,17 +65,22 @@ class ReportService:
             total=row.total,
         )
 
-    def _load_all(self, session: Session) -> list[Report]:
-        rows = session.scalars(select(ReportRow).order_by(ReportRow.report_id)).all()
-        return [self._row_to_report(r) for r in rows]
+    def _load_rows(self, session: Session, status: str | None = None) -> list[ReportRow]:
+        stmt = select(ReportRow).order_by(ReportRow.report_id)
+        if status is not None:
+            stmt = stmt.where(ReportRow.status == status)
+        return list(session.scalars(stmt).all())
+
+    def _load_online(self, session: Session) -> list[Report]:
+        return [self._row_to_report(r) for r in self._load_rows(session, STATUS_ONLINE)]
 
     # ------------------------------------------------------------------ #
-    # 求解缓存（只依赖当前库里的报表内容版本）
+    # 求解缓存（只依赖当前在线报表内容版本）
     # ------------------------------------------------------------------ #
     def current_solution(self, session: Session) -> SolvedSystem:
         with self._lock:
             if self._cache is None:
-                self._cache = solver.solve(self._load_all(session))
+                self._cache = solver.solve(self._load_online(session))
             return self._cache
 
     def _invalidate(self) -> None:
@@ -81,14 +106,15 @@ class ReportService:
             replaced_ids = [rid for rid in ids_in_batch if rid in existing_rows]
             inserted_ids = [rid for rid in ids_in_batch if rid not in existing_rows]
 
-            # 2) 120 份容量护栏（替换不占新名额）。
+            # 2) 120 份容量护栏（在线 + 归档合计；替换不占新名额）。
             projected_count = len(existing_rows) + len(inserted_ids)
             if projected_count > MAX_REPORT_COUNT:
                 raise CapacityExceededError(
-                    f"入库后将有 {projected_count} 份报表，超过最多 {MAX_REPORT_COUNT} 份上限"
+                    f"入库后将有 {projected_count} 份报表（含归档件），"
+                    f"超过最多 {MAX_REPORT_COUNT} 份上限"
                 )
 
-            # 3) 用“替换后的整份视图”拼出候选集合，再与现行其余报表核对。
+            # 3) 补录与在线及归档报表一起验算：用“替换后的整份视图”拼出候选集合。
             merged: dict[str, Report] = {
                 rid: self._row_to_report(row) for rid, row in existing_rows.items()
             }
@@ -105,11 +131,42 @@ class ReportService:
                 )
                 raise BatchConflictError(
                     conflict_ids,
-                    "本批报表与已生效报表无法同时成立，整批退回；"
+                    "本批报表与在线及归档报表无法同时成立，整批退回；"
                     "去掉冲突组内任意一份后其余报表可自洽",
                 )
 
-            # 5) 全部通过 -> 原子落库（同事务，异常整体回滚）。
+            # 5) 同号更正后的报表一律转为在线；其余未被本批触及的归档件，
+            #    按补录后的在线报表重新核对“总量可由在线报表唯一推出”，
+            #    失去依据者随补报恢复在线，其余继续归档。
+            incoming_ids = set(ids_in_batch)
+            post_online_reports: list[Report] = []
+            archived_to_check: list[ReportRow] = []
+            for rid, row in existing_rows.items():
+                if rid in incoming_ids:
+                    continue  # 被整份替换，落库时转在线
+                if row.status == STATUS_ARCHIVED:
+                    archived_to_check.append(row)
+                else:
+                    post_online_reports.append(self._row_to_report(row))
+            post_online_reports.extend(incoming)
+
+            restored_rows: list[ReportRow] = []
+            if archived_to_check:
+                results = solver.evaluate_interval_totals(
+                    post_online_reports,
+                    [
+                        (
+                            date.fromisoformat(row.start_date),
+                            date.fromisoformat(row.end_date),
+                        )
+                        for row in archived_to_check
+                    ],
+                )
+                for row, res in zip(archived_to_check, results, strict=True):
+                    if not res.unique:
+                        restored_rows.append(row)
+
+            # 6) 全部通过 -> 原子落库（同事务，异常整体回滚）。
             try:
                 for r in incoming:
                     row = existing_rows.get(r.report_id)
@@ -121,6 +178,7 @@ class ReportService:
                                 end_date=r.end_date.isoformat(),
                                 total=r.total,
                                 version=1,
+                                status=STATUS_ONLINE,
                             )
                         )
                     else:
@@ -128,6 +186,9 @@ class ReportService:
                         row.end_date = r.end_date.isoformat()
                         row.total = r.total
                         row.version += 1
+                        row.status = STATUS_ONLINE  # 同号更正 -> 转在线
+                for row in restored_rows:
+                    row.status = STATUS_ONLINE
                 session.commit()
             except Exception:
                 session.rollback()
@@ -137,17 +198,113 @@ class ReportService:
             final_rows = session.scalars(
                 select(ReportRow).where(ReportRow.report_id.in_(ids_in_batch))
             ).all()
+            online_count = session.scalar(
+                select(func.count())
+                .select_from(ReportRow)
+                .where(ReportRow.status == STATUS_ONLINE)
+            )
+            archived_count = session.scalar(
+                select(func.count())
+                .select_from(ReportRow)
+                .where(ReportRow.status == STATUS_ARCHIVED)
+            )
             return {
-                "stored_count": session.scalar(
-                    select(func.count()).select_from(ReportRow)
-                ),
+                "stored_count": online_count + archived_count,
+                "online_count": online_count,
+                "archived_count": archived_count,
                 "replaced_ids": sorted(replaced_ids),
                 "inserted_ids": sorted(inserted_ids),
+                "restored_ids": sorted(row.report_id for row in restored_rows),
                 "rows": final_rows,
             }
 
     # ------------------------------------------------------------------ #
-    # 查数
+    # 整批归档
+    # ------------------------------------------------------------------ #
+    def archive_batch(self, session: Session, report_ids: list[str]) -> dict:
+        with self._lock:
+            # 1) 入参与当前状态核对（按提交时的数据判断）。
+            ids = list(dict.fromkeys(report_ids))  # 去重保序
+            if len(ids) != len(report_ids):
+                dupes = sorted({x for x in report_ids if report_ids.count(x) > 1})
+                raise ReportValidationError(f"同一批内归档编号重复: {', '.join(dupes)}")
+
+            rows_by_id = {
+                row.report_id: row
+                for row in session.scalars(select(ReportRow)).all()
+            }
+            missing = [rid for rid in ids if rid not in rows_by_id]
+            if missing:
+                raise ReportValidationError(
+                    f"以下报表编号不存在，无法归档: {', '.join(sorted(missing))}"
+                )
+            not_online = sorted(
+                rid for rid in ids if rows_by_id[rid].status != STATUS_ONLINE
+            )
+            if not_online:
+                raise ReportValidationError(
+                    f"以下报表不是在线状态（已归档或不存在），无法重复归档: "
+                    f"{', '.join(not_online)}"
+                )
+
+            target_set = set(ids)
+            online_rows = self._load_rows(session, STATUS_ONLINE)
+            remaining_rows = [row for row in online_rows if row.report_id not in target_set]
+            target_rows = [rows_by_id[rid] for rid in ids]
+
+            # 2) 只有“移出整批后”剩余在线报表仍能唯一推出每份原件的区间
+            #    总人次，才允许归档；一次建图批量判定。
+            results = solver.evaluate_interval_totals(
+                [self._row_to_report(row) for row in remaining_rows],
+                [
+                    (
+                        date.fromisoformat(row.start_date),
+                        date.fromisoformat(row.end_date),
+                    )
+                    for row in target_rows
+                ],
+            )
+            non_derivable = sorted(
+                row.report_id
+                for row, res in zip(target_rows, results, strict=True)
+                if not res.unique
+            )
+            if non_derivable:
+                # 验算失败：不做任何状态变更。
+                raise ArchiveConditionError(
+                    non_derivable,
+                    "整批移出后，剩余在线报表无法唯一推出上述报表的档期总量，"
+                    "本批归档请求被拒绝，报表状态不变",
+                )
+
+            # 3) 条件成立 -> 原子落库。
+            try:
+                for row in target_rows:
+                    row.status = STATUS_ARCHIVED
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            self._invalidate()
+
+            online_count = session.scalar(
+                select(func.count())
+                .select_from(ReportRow)
+                .where(ReportRow.status == STATUS_ONLINE)
+            )
+            archived_count = session.scalar(
+                select(func.count())
+                .select_from(ReportRow)
+                .where(ReportRow.status == STATUS_ARCHIVED)
+            )
+            return {
+                "archived_ids": ids,
+                "online_count": online_count,
+                "archived_count": archived_count,
+            }
+
+    # ------------------------------------------------------------------ #
+    # 查数（只用同一套在线报表；归档件不参与）
     # ------------------------------------------------------------------ #
     def query_daily(
         self,

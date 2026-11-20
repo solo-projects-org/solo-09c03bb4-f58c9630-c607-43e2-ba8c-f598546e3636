@@ -6,6 +6,8 @@ from datetime import date
 
 from pydantic import BaseModel, Field, field_validator
 
+from .database import STATUS_ARCHIVED, STATUS_ONLINE
+
 
 class ReportIn(BaseModel):
     report_id: str = Field(..., examples=["R2024-001"], description="报表编号，唯一")
@@ -31,13 +33,26 @@ class ReportOut(BaseModel):
     end_date: date
     total: int
     version: int
+    status: str = Field(
+        ...,
+        description=(
+            f"{STATUS_ONLINE}=在线（参与查数）；{STATUS_ARCHIVED}=归档（留档备查，"
+            "不参与在线查数，其总量仍可由在线报表唯一推出）"
+        ),
+    )
 
 
 class BatchUploadOut(BaseModel):
     accepted: bool
-    stored_count: int = Field(..., description="入库后现行报表总数")
+    stored_count: int = Field(..., description="入库后报表总数（含归档件，上限 120）")
+    online_count: int = Field(..., description="入库后在线报表数量")
+    archived_count: int = Field(..., description="入库后归档报表数量")
     replaced_ids: list[str] = Field(default_factory=list, description="本批整份替换的编号")
     inserted_ids: list[str] = Field(default_factory=list, description="本批新增的编号")
+    restored_ids: list[str] = Field(
+        default_factory=list,
+        description="补录后失去在线依据、随补报从归档恢复为在线的编号",
+    )
     reports: list[ReportOut] = Field(default_factory=list, description="入库后该批报表视图")
 
 
@@ -49,11 +64,43 @@ class ConflictOut(BaseModel):
     reason: str
 
 
+class ArchiveIn(BaseModel):
+    report_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description="本批申请归档的在线报表编号；整批同时成立才会移出在线集合",
+    )
+
+    @field_validator("report_ids")
+    @classmethod
+    def _ids_not_blank(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values]
+        if any(not v for v in cleaned):
+            raise ValueError("报表编号不能为空")
+        return cleaned
+
+
+class ArchiveOut(BaseModel):
+    accepted: bool
+    archived_ids: list[str] = Field(default_factory=list, description="本批转为归档的编号")
+    online_count: int = Field(..., description="归档后在线报表数量")
+    archived_count: int = Field(..., description="归档后归档报表数量（含本批）")
+
+
+class ArchiveRejectedOut(BaseModel):
+    accepted: bool = False
+    non_derivable_report_ids: list[str] = Field(
+        ...,
+        description="移出整批后，剩余在线报表无法唯一推出其档期总量的报表编号",
+    )
+    reason: str
+
+
 class DailyValueOut(BaseModel):
     day: date
     status: str = Field(..., description="determined=唯一确定；pending=待补")
     visitors: int | None = None
-    covered: bool = Field(..., description="该日是否被至少一份现行报表覆盖")
+    covered: bool = Field(..., description="该日是否被至少一份在线报表覆盖")
 
 
 class DailyQueryOut(BaseModel):

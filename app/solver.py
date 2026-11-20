@@ -35,6 +35,13 @@
 
 最小值 = 最大值（且有限）时，该日人次被唯一确定；整数边权保证结果为
 整数。日期不在任何报表区间内时没有有限界，返回“待补”。
+
+区间总量唯一值（归档判定）
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+归档一份报表前，要确认把它移出在线集合后，剩余在线报表仍能唯一推出
+它的档期总量 P_e - P_{s-1}：该量的下界为 L[s-1][e]、上界为 -L[e][s-1]，
+两者均有限且相等即可，唯一值即该整数（必然等于报表原总量，因为全集
+自洽时报表等式本身就是一组可行约束）。
 """
 
 from __future__ import annotations
@@ -51,6 +58,8 @@ MAX_REPORT_COUNT = 120
 # 现实护栏：90 天景区总人次不可能超过 10^12，同时保证 int64 路径和不溢出。
 MAX_TOTAL = 10**12
 _NEG = -(10**15)
+# 路径不可达判定阈值：不可达单元为 _NEG=-10^15，真实路径绝对值远小于该量级。
+_UNREACHABLE = -(10**13)
 
 
 class ReportValidationError(ValueError):
@@ -98,6 +107,31 @@ class SolvedSystem:
     covered_undetermined: frozenset[date]
 
 
+@dataclass(frozen=True)
+class IntervalTotalResult:
+    """单个区间 [start_date, end_date] 的总量 P_e - P_{s-1} 判定结果。"""
+
+    start_date: date
+    end_date: date
+    finite: bool
+    unique: bool
+    value: int | None
+
+
+@dataclass(frozen=True)
+class _ConstraintGraph:
+    """差分约束压缩图及其全源最长路矩阵。"""
+
+    reports: tuple[Report, ...]
+    # 不含锚点的边界日期（升序）；矩阵索引 = 该列表位置 + 1
+    node_dates: list[date]
+    # 含锚点：[锚点日期, ...node_dates]，下标即矩阵索引
+    node_dates_with_anchor: list[date]
+    idx: dict[date, int]
+    longest: np.ndarray
+    feasible: bool
+
+
 def _floyd_longest(node_count: int, edges: Sequence[tuple[int, int, int]]) -> np.ndarray:
     """全源最长路。不可达为 _NEG；正权环表现为对角线 > 0。"""
     mat = np.full((node_count, node_count), _NEG, dtype=np.int64)
@@ -110,27 +144,41 @@ def _floyd_longest(node_count: int, edges: Sequence[tuple[int, int, int]]) -> np
     return mat
 
 
-def solve(reports: Iterable[Report]) -> SolvedSystem:
-    """对一整套报表求解可行性与每日唯一值。"""
+def _dedupe(reports: Iterable[Report]) -> tuple[Report, ...]:
     unique: dict[str, Report] = {}
     for r in reports:
         r.validate()
         unique[r.report_id] = r  # 同编号以后者为准（整份替换语义）
-    ordered = tuple(unique.values())
+    return tuple(unique.values())
 
-    if not ordered:
-        return SolvedSystem(True, (), {}, frozenset())
 
-    # --- 压缩节点：锚点 0 为 P_0，其余节点按日期排序 ---------------------
-    boundary_set: set[date] = set()
-    covered: set[date] = set()
+def build_graph(
+    reports: Iterable[Report],
+    extra_boundaries: Iterable[date] | None = None,
+) -> _ConstraintGraph:
+    """把一套报表建成差分约束压缩图并求全源最长路。
+
+    extra_boundaries 中的日期会作为额外图节点（只接非负链边，不改变可行
+    域），用于查询这些端点上的前缀和差值，例如归档判定时的报表端点。
+    """
+    ordered = _dedupe(reports)
+
+    boundary_set: set[date] = set(extra_boundaries or ())
     for r in ordered:
         boundary_set.add(r.start_date - timedelta(days=1))
         boundary_set.add(r.end_date)
-        cur = r.start_date
-        while cur <= r.end_date:
-            covered.add(cur)
-            cur += timedelta(days=1)
+
+    if not boundary_set:
+        # 空系统：只有锚点一个节点。
+        anchor_only = [date.min]
+        return _ConstraintGraph(
+            reports=ordered,
+            node_dates=[],
+            node_dates_with_anchor=anchor_only,
+            idx={date.min: 0},
+            longest=np.zeros((1, 1), dtype=np.int64),
+            feasible=True,
+        )
 
     node_dates = sorted(boundary_set)
     # 矩阵索引：0 = 锚点；list 中第 p 个日期 -> 索引 p+1
@@ -138,6 +186,7 @@ def solve(reports: Iterable[Report]) -> SolvedSystem:
     anchor_date = node_dates[0] - timedelta(days=1)
     node_date_with_anchor = [anchor_date] + node_dates
     n = len(node_dates) + 1
+    idx[anchor_date] = 0
 
     edges: list[tuple[int, int, int]] = []
     # 非负链边（含锚点到最早节点）
@@ -151,8 +200,37 @@ def solve(reports: Iterable[Report]) -> SolvedSystem:
         edges.append((e_node, s_node, -r.total))
 
     longest = _floyd_longest(n, edges)
-    if np.any(np.diag(longest) > 0):
+    feasible = not bool(np.any(np.diag(longest) > 0))
+    return _ConstraintGraph(
+        reports=ordered,
+        node_dates=node_dates,
+        node_dates_with_anchor=node_date_with_anchor,
+        idx=idx,
+        longest=longest,
+        feasible=feasible,
+    )
+
+
+def solve(reports: Iterable[Report]) -> SolvedSystem:
+    """对一整套报表求解可行性与每日唯一值。"""
+    ordered = _dedupe(reports)
+    if not ordered:
+        return SolvedSystem(True, (), {}, frozenset())
+
+    covered: set[date] = set()
+    for r in ordered:
+        cur = r.start_date
+        while cur <= r.end_date:
+            covered.add(cur)
+            cur += timedelta(days=1)
+
+    graph = build_graph(ordered)
+    if not graph.feasible:
         return SolvedSystem(False, ordered, {}, frozenset(covered))
+
+    longest = graph.longest
+    node_dates = graph.node_dates
+    node_date_with_anchor = graph.node_dates_with_anchor
 
     # --- 逐日上下界 ------------------------------------------------------
     # node_dates[i] 的矩阵索引为 i+1；锚点（索引 0）对应日期为其前一天。
@@ -180,6 +258,45 @@ def solve(reports: Iterable[Report]) -> SolvedSystem:
         determined=determined,
         covered_undetermined=frozenset(undetermined),
     )
+
+
+def evaluate_interval_totals(
+    remaining_reports: Iterable[Report],
+    intervals: Sequence[tuple[date, date]],
+) -> list[IntervalTotalResult]:
+    """判定每个区间总量 P_e - P_{s-1} 能否由剩余报表唯一推出。
+
+    所有区间共用一张压缩图（区间端点作为额外节点注入），一次
+    Floyd-Warshall 即可批量判定，适合整批归档的提交时校验。
+    """
+    boundaries: list[date] = []
+    for s, e in intervals:
+        if e < s:
+            raise ReportValidationError(f"区间末日 {e} 早于首天 {s}")
+        boundaries.append(s - timedelta(days=1))
+        boundaries.append(e)
+
+    graph = build_graph(remaining_reports, extra_boundaries=boundaries)
+    longest = graph.longest
+    results: list[IntervalTotalResult] = []
+    for s, e in intervals:
+        lo = graph.idx[s - timedelta(days=1)]
+        hi = graph.idx[e]
+        lower_path = int(longest[lo, hi])  # P_hi - P_lo 的最长路下界
+        reverse_path = int(longest[hi, lo])  # P_lo - P_hi 的最长路；上界 = -reverse
+        # 双向都必须可达：任一方向不可达（_NEG）则该总量无有限界。
+        finite = lower_path > _UNREACHABLE and reverse_path > _UNREACHABLE
+        unique = finite and graph.feasible and lower_path == -reverse_path
+        results.append(
+            IntervalTotalResult(
+                start_date=s,
+                end_date=e,
+                finite=finite,
+                unique=unique,
+                value=lower_path if unique else None,
+            )
+        )
+    return results
 
 
 def find_minimal_conflict(
